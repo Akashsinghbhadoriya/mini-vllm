@@ -1,0 +1,12 @@
+# PagedAttention
+
+Vllm solves the problem of serving llms efficiently and provide a 24x better throughput than hf transformers. It implements PagedAttention an attention algorithm inspired by the classic idea of virtual memory and paging in operating systems. Unlike the traditional attention algorithms, paged attention allows storing the continuous keys and values in non-contiguous memoery space. Specifically, PagedAttention partitions the KV cache of each sequence into blocks, each block containing the keys and values for fixed number of tokens.
+During the attention computation, the PagedAttention kernel identifies and fetches these blocks efficiently. Blocks are not contiguous in memory, the contiguous logical blocks of a sequence are mapped to the non-contiguous physical blocks via a block table. The physical blocks are allocated on demand as new tokens are generated.
+
+In PagedAttention the memory wastage only happens in the last block of the sequence this results in a near-optimal memory usage with a waste under 4%. This boost in memory efficiency proves highly beneficial: It allows the system to batch more sequences together, increase GPU utilization, and thereby significantly increase the throughput as shown in the performance result above.
+
+PagedAttention has another key advantage: efficient memory sharing. For example, in parallel sampling, multiple output sequences are generated from the same prompt. In this case, the computation and memory for the prompt can be shared between the output sequences.
+
+PagedAttention naturally enables memory sharing through its block table. Similar to how processes share physical pages, different sequences in PagedAttention can share the blocks by mapping their logical blocks to the same physical block. To ensure safe sharing, PagedAttention keeps track of the reference counts of the physical blocks and implements the Copy-on-Write mechanism.
+
+PageAttention’s memory sharing greatly reduces the memory overhead of complex sampling algorithms, such as parallel sampling and beam search, cutting their memory usage by up to 55%. This can translate into up to 2.2x improvement in throughput. This makes such sampling methods practical in LLM services.
