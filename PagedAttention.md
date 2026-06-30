@@ -1,12 +1,47 @@
 # PagedAttention
 
-Vllm solves the problem of serving llms efficiently and provide a 24x better throughput than hf transformers. It implements PagedAttention an attention algorithm inspired by the classic idea of virtual memory and paging in operating systems. Unlike the traditional attention algorithms, paged attention allows storing the continuous keys and values in non-contiguous memoery space. Specifically, PagedAttention partitions the KV cache of each sequence into blocks, each block containing the keys and values for fixed number of tokens.
-During the attention computation, the PagedAttention kernel identifies and fetches these blocks efficiently. Blocks are not contiguous in memory, the contiguous logical blocks of a sequence are mapped to the non-contiguous physical blocks via a block table. The physical blocks are allocated on demand as new tokens are generated.
+## The Problem
 
-In PagedAttention the memory wastage only happens in the last block of the sequence this results in a near-optimal memory usage with a waste under 4%. This boost in memory efficiency proves highly beneficial: It allows the system to batch more sequences together, increase GPU utilization, and thereby significantly increase the throughput as shown in the performance result above.
+Traditional LLM inference allocates a **contiguous block of GPU memory** per sequence to store its KV cache. This causes two problems:
 
-PagedAttention has another key advantage: efficient memory sharing. For example, in parallel sampling, multiple output sequences are generated from the same prompt. In this case, the computation and memory for the prompt can be shared between the output sequences.
+1. **Fragmentation** — memory is reserved upfront based on max sequence length, most of which sits unused
+2. **No sharing** — even when two sequences share a common prefix (e.g. the same system prompt), their KV caches are stored separately
 
-PagedAttention naturally enables memory sharing through its block table. Similar to how processes share physical pages, different sequences in PagedAttention can share the blocks by mapping their logical blocks to the same physical block. To ensure safe sharing, PagedAttention keeps track of the reference counts of the physical blocks and implements the Copy-on-Write mechanism.
+## The Idea: Virtual Memory for KV Cache
 
-PageAttention’s memory sharing greatly reduces the memory overhead of complex sampling algorithms, such as parallel sampling and beam search, cutting their memory usage by up to 55%. This can translate into up to 2.2x improvement in throughput. This makes such sampling methods practical in LLM services.
+PagedAttention is inspired by how operating systems manage virtual memory with **paging**. Instead of one contiguous block per sequence, the KV cache is split into fixed-size **blocks** (pages), each holding the keys and values for a fixed number of tokens.
+
+A **block table** maps each sequence's logical blocks to physical blocks in GPU memory — the same way an OS page table maps virtual pages to physical memory frames.
+
+Physical blocks are allocated **on demand** as new tokens are generated, not upfront.
+
+## Memory Efficiency
+
+In traditional attention, any unused capacity within a pre-allocated contiguous buffer is wasted.  
+In PagedAttention, waste only happens in the **last block** of each sequence (partially filled).
+
+This results in **near-optimal memory utilization — under 4% waste**.
+
+Less wasted memory → more sequences fit in GPU memory simultaneously → better GPU utilization → higher throughput.
+
+## Memory Sharing (Copy-on-Write)
+
+PagedAttention unlocks efficient memory sharing between sequences that share a common prefix.
+
+**Example — parallel sampling**: generate N different completions for the same prompt. With PagedAttention:
+- All N sequences map their prompt blocks to the **same physical blocks**
+- Only diverging (newly generated) tokens get their own blocks
+- Reference counts track how many sequences point to each physical block
+- **Copy-on-Write** is used when a shared block needs to be modified
+
+This cuts memory usage for parallel sampling and beam search by up to **55%**, translating to up to **2.2x improvement in throughput**.
+
+## Summary
+
+| Property | Traditional | PagedAttention |
+|---|---|---|
+| Memory layout | Contiguous per sequence | Non-contiguous blocks |
+| Allocation | Upfront (max length) | On demand |
+| Memory waste | High (fragmentation) | <4% (last block only) |
+| Prefix sharing | Not possible | Yes (block table mapping) |
+| Beam search overhead | High | Reduced by ~55% |
