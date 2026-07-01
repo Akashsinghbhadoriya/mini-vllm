@@ -6,9 +6,9 @@ class Scheduler:
         
         self.active_requests = []
 
-    def add_request(self, request):
+    def add_requests(self, requests):
 
-        self.active_requests.append(request)
+        self.active_requests.extend(requests)
 
     def get_batch(self):
 

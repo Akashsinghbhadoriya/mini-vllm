@@ -11,13 +11,14 @@ class Engine:
 
         self.model_runner.load_model()
 
-    def add_request(self, request):
+    def generate(self, request):
 
-        self.all_requests.append(request)
-        self.scheduler.add_request(request)
+        return self.generate_batch([request])
     
-    def run(self):
+    def generate_batch(self, requests):
 
+        self.all_requests = requests
+        self.scheduler.add_requests(requests)
         # Prefill all the Requests
         batch = self.scheduler.get_batch()
         self.model_runner.prefill_batch(batch)

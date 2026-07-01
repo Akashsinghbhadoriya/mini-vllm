@@ -12,10 +12,8 @@ scheduler = Scheduler()
 
 engine = Engine(model_runner, scheduler)
 
-engine.add_request(req1)
-engine.add_request(req2)
-engine.add_request(req3)
+requests = [req1, req2, req3]
 
-output = engine.run()
+output = engine.generate_batch(requests)
 
 print(output)
