@@ -28,3 +28,5 @@ idx_next = torch.multinomial(probs, num_samples = 1)
 print(idx_next)
 next_text = tokenizer.decode(idx_next)
 print(next_text)
+
+print(past_key_values)

@@ -3,38 +3,34 @@ import torch
 
 class Engine:
 
-    def __init__(self, model_runner):
+    def __init__(self, model_runner, scheduler):
         
-        self.active_requests = []
         self.model_runner = model_runner
+        self.scheduler = scheduler
+        self.all_requests = []
 
         self.model_runner.load_model()
 
     def add_request(self, request):
 
-        self.active_requests.append(request)
+        self.all_requests.append(request)
+        self.scheduler.add_request(request)
     
     def run(self):
 
         # Prefill all the Requests
-        for request in self.active_requests:
-            self.model_runner.prefill(request)
-            request.mark_running()
+        batch = self.scheduler.get_batch()
+        self.model_runner.prefill_batch(batch)
         
-        while not self.all_finished():
+        while self.scheduler.has_pending_requests():
 
-            for request in self.active_requests:
+            self.model_runner.decode_batch(batch)
 
-                if request.status == RequestStatus.FINISHED:
-                    continue
-
-                self.model_runner.decode_one_step(request)
-
-                self.check_stop_conditions(request)
+            self.scheduler.remove_finished()
         
         outputs = []
 
-        for r in self.active_requests:
+        for r in self.all_requests:
             
             if r.status == RequestStatus.FINISHED:
                 token_ids = torch.cat([r.prompt_token_ids, torch.cat(r.generated_token_ids,dim=1)], dim=1)
