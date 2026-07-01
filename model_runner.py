@@ -1,4 +1,4 @@
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, DynamicCache
 import torch
 from torch.nn import functional as F
 from request import RequestStatus
@@ -100,7 +100,7 @@ class ModelRunner:
         last_tokens = [request.last_token_id for request in batch]
         input_ids = torch.tensor(last_tokens).unsqueeze(1)
 
-        batched_kv = []
+        batched_kv = DynamicCache()
         num_layers = len(batch[0].past_key_values)
         for layer_idx in range(num_layers):
             layer_keys = []
@@ -111,7 +111,7 @@ class ModelRunner:
                 layer_values.append(layer_v)
             batch_k = torch.cat(layer_keys, dim=0)
             batch_v = torch.cat(layer_values, dim=0)
-            batched_kv.append((batch_k, batch_v))
+            batched_kv.update(batch_k, batch_v, layer_idx)
         
         outputs = self.model(
             input_ids = input_ids,
@@ -137,8 +137,9 @@ class ModelRunner:
 
     def extract_request_kv(self, batch_past_key_values, batch_index):
         request_kv = []
-        for layer_k, layer_v in zip(batch_past_key_values.key_cache, batch_past_key_values.value_cache):
-            
+        for layer in batch_past_key_values.layers:
+            layer_k = layer.keys
+            layer_v = layer.values
             request_kv.append((
                 layer_k[batch_index : batch_index + 1], 
                 layer_v[batch_index : batch_index + 1]

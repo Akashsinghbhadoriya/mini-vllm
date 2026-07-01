@@ -30,3 +30,7 @@ next_text = tokenizer.decode(idx_next)
 print(next_text)
 
 print(past_key_values)
+
+for layer in past_key_values.layers:
+    print(layer.keys)
+    print(layer.values)

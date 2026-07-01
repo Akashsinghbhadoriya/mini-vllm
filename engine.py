@@ -33,7 +33,7 @@ class Engine:
         for r in self.all_requests:
             
             if r.status == RequestStatus.FINISHED:
-                token_ids = torch.cat([r.prompt_token_ids, torch.cat(r.generated_token_ids,dim=1)], dim=1)
+                token_ids = r.prompt_token_ids + r.generated_token_ids
                 text = self.model_runner.decode_tokens(token_ids)
                 outputs.append({
                     "request_id": r.request_id,
