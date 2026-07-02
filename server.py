@@ -5,6 +5,7 @@ from scheduler import Scheduler
 from request_queue import RequestQueue
 from response_queue import ReponseQueue
 import threading
+import time
 
 class Server:
 
@@ -34,8 +35,12 @@ class Server:
             request_id = self.request_counter
 
         request = Request(request_id, prompt)
+        request.start_time = time.time()
         self.request_queue.enqueue(request)
 
         print(f"Submitted Request {request_id}")
         request.completed.wait()
-        return request.generated_text
+        request.end_time = time.time()
+
+        latency = request.end_time - request.start_time
+        return request.generated_text, request_id, latency

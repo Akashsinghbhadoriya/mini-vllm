@@ -1,17 +1,22 @@
+import threading
+
+print_lock = threading.Lock()
+
 def client(server, prompt):
 
-    response = server.submit_request(prompt)
+    response, request_id, latency = server.submit_request(prompt)
 
-    print("--------------------------------")
+    with print_lock:
+        print("--------------------------------")
+        print(f"[Request {request_id}] Latency: {latency:.3f}s")
+        print("Prompt:")
 
-    print("Prompt:")
+        print(prompt)
 
-    print(prompt)
+        print()
 
-    print()
+        print("Response:")
 
-    print("Response:")
+        print(response)
 
-    print(response)
-
-    print("--------------------------------")
+        print("--------------------------------")

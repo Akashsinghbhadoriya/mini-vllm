@@ -23,6 +23,8 @@ class Request:
         self.past_key_values = None
         self.generated_text = None
         self.completed = threading.Event()
+        self.start_time = None
+        self.end_time = None
 
     def mark_running(self):
         self.status = RequestStatus.RUNNING
