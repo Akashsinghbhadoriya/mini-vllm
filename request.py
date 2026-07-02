@@ -1,4 +1,5 @@
 from enum import Enum, auto
+import threading
 
 class RequestStatus(Enum):
 
@@ -20,6 +21,8 @@ class Request:
         self.prompt_token_ids = None
         self.last_token_id = None
         self.past_key_values = None
+        self.generated_text = None
+        self.completed = threading.Event()
 
     def mark_running(self):
         self.status = RequestStatus.RUNNING

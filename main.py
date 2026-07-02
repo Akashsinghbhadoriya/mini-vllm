@@ -1,19 +1,40 @@
-from engine import Engine
-from model_runner import ModelRunner
-from request import Request
-from scheduler import Scheduler
+from server import Server
+from client import client
+import threading
 
-req1 = Request(1, "what is your name")
-req2 = Request(2, "What is the capital of India")
-req3 = Request(3, "how many countries in the world?")
+server = Server()
+server.start()
 
-model_runner = ModelRunner()
-scheduler = Scheduler()
+thread1 = threading.Thread(
+    target=client,
+    args=(
+        server,
+        "Explain transformers."
+    )
+)
 
-engine = Engine(model_runner, scheduler)
+thread2 = threading.Thread(
+    target=client,
+    args=(
+        server,
+        "Explain LoRA."
+    )
+)
 
-requests = [req1, req2, req3]
+thread3 = threading.Thread(
+    target=client,
+    args=(
+        server,
+        "Explain FlashAttention."
+    )
+)
 
-output = engine.generate_batch(requests)
+thread1.start()
+thread2.start()
+thread3.start()
 
-print(output)
+thread1.join()
+thread2.join()
+thread3.join()
+
+server.engine.stop()

@@ -1,26 +1,47 @@
 from request import RequestStatus
 import torch
+import threading
 
 class Engine:
 
-    def __init__(self, model_runner, scheduler):
+    def __init__(self, model_runner, scheduler, request_queue = None, response_queue = None):
         
         self.model_runner = model_runner
         self.scheduler = scheduler
         self.all_requests = []
-
+        self.request_queue = request_queue
+        self.response_queue = response_queue
         self.model_runner.load_model()
 
+    def start(self):
+        self.running = True
+
+        self.engine_thread = threading.Thread(
+            target=self.serve,
+            daemon=True
+        )
+
+        self.engine_thread.start()
+        print("Engine started")
+    
+    def stop(self):
+
+        self.running = False
+        self.engine_thread.join()
+        print("Engine Stopped")
+
+    # Sequential Processing of requests
     def generate(self, request):
 
         return self.generate_batch([request])
     
+    #static batching for benchmarking
     def generate_batch(self, requests):
 
         self.all_requests = requests
-        self.scheduler.add_requests(requests)
+        self.scheduler.add_active(requests)
         # Prefill all the Requests
-        batch = self.scheduler.get_batch()
+        batch = self.scheduler.get_active()
         self.model_runner.prefill_batch(batch)
         
         while self.scheduler.has_pending_requests():
@@ -43,6 +64,26 @@ class Engine:
         
         return outputs
 
+    def serve(self):
+        
+        while self.running:
+
+            if self.scheduler.has_capacity():
+                capacity = self.scheduler.get_capacity()
+                new_requests = self.request_queue.dequeue_many(capacity)
+                if new_requests:
+                    self.scheduler.add_active(new_requests)
+                    self.model_runner.prefill_batch(new_requests)
+
+            if self.scheduler.has_active():
+                batch = self.scheduler.get_active()
+
+                self.model_runner.decode_batch(batch)
+                finished_request = self.scheduler.remove_finished()
+
+                for request in finished_request:
+                    self.decode_text(request)
+                    self.response_queue.enqueue(request)
     
     def check_stop_conditions(self, request):
 
@@ -58,3 +99,9 @@ class Engine:
             if r.status != RequestStatus.FINISHED:
                 return False
         return True
+    
+    def decode_text(self, request):
+        token_ids = request.prompt_token_ids + request.generated_token_ids
+        text = self.model_runner.decode_tokens(token_ids)
+        request.generated_text = text
+        request.completed.set()

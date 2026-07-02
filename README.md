@@ -7,18 +7,21 @@ A minimal from-scratch implementation of the core ideas behind [vLLM](https://gi
 vLLM achieves up to 24x better throughput than naive HuggingFace inference by rethinking how GPU memory is managed during generation. This project implements the foundational concepts:
 
 - **Request lifecycle** with explicit status transitions (STARTED → RUNNING → FINISHED)
-- **Prefill phase** — processes the full prompt, builds the initial KV cache
-- **Decode phase** — generates one token at a time, reusing cached KV values
-- **Engine loop** — batches multiple requests and drives them through prefill + decode
+- **Prefill phase** — processes the full prompt batch together, builds the initial KV cache per request
+- **Decode phase** — generates one token at a time across all active requests, reusing cached KV values
+- **Scheduler** — manages the active request batch and drives status transitions
+- **Engine loop** — orchestrates prefill + decode across a batch of requests until all finish
 
 ## Project Structure
 
 ```
 miniVllm/
 ├── main.py              # Entry point — creates requests and runs the engine
-├── engine.py            # Core inference loop (prefill all, then decode until done)
-├── model_runner.py      # Wraps HuggingFace model: prefill() and decode_one_step()
+├── engine.py            # Core inference loop (batch prefill, then batch decode until done)
+├── model_runner.py      # Wraps HuggingFace model: prefill_batch() and decode_batch()
 ├── request.py           # Request dataclass + RequestStatus enum
+├── scheduler.py         # Manages active request batches and status transitions
+├── benchmark.py         # Benchmarks sequential vs batch inference throughput
 ├── inspect_forward.py   # Scratch file for exploring model forward pass outputs
 ├── vllm.md              # Notes on vLLM concepts: prefill vs decode
 ├── PagedAttention.md    # Notes on PagedAttention memory management
@@ -36,26 +39,37 @@ Each `Request` holds:
 - Cached `past_key_values` from the model (the KV cache)
 - A `RequestStatus` tracking where it is in the pipeline
 
-### 2. Engine
+### 2. Scheduler
+
+The `Scheduler` manages the active request batch:
+- `add_requests(requests)` — registers new requests (status: WAITING)
+- `get_batch()` — returns all currently active requests
+- `remove_finished()` — evicts requests that have reached FINISHED status
+
+### 3. Engine
 
 ```
-prefill(req)  →  mark_running()
+add_requests(reqs) → scheduler manages batch
      ↓
-decode_one_step(req)  →  check_stop_conditions()
+prefill_batch(all_requests)  →  mark all RUNNING
      ↓
-repeat until all requests are FINISHED
+while has_pending():
+    decode_batch(active_requests)  →  check stop conditions per request
+    scheduler.remove_finished()
+     ↓
+all requests FINISHED
 ```
 
-The engine prefills all requests first, then enters a decode loop. Each decode step feeds only the last generated token (not the full sequence) and reuses `past_key_values` — this is the KV cache at work.
+All requests are prefilled together in a single batched forward pass. The decode loop then processes all active requests jointly each step, reusing each request's `past_key_values` — this is the KV cache at work.
 
-### 3. ModelRunner
+### 4. ModelRunner
 
-Wraps `AutoModelForCausalLM` with two methods:
+Wraps `AutoModelForCausalLM` with two batch-oriented methods:
 
-- **`prefill(request)`** — tokenizes the prompt, runs a full forward pass, samples the first output token, stores `past_key_values` on the request
-- **`decode_one_step(request)`** — runs a forward pass on just the last token with cached KV values, samples the next token
+- **`prefill_batch(requests)`** — tokenizes and pads the prompt batch, runs one joint forward pass, extracts per-request KV cache from the batched output, samples the first token for each request
+- **`decode_batch(requests)`** — concatenates per-request KV caches into a batched structure, runs a forward pass on only the last tokens (one per request), samples the next token, updates each request's KV cache for the next step
 
-Sampling is done via softmax + multinomial sampling (temperature=1).
+Sampling uses softmax + multinomial sampling (temperature=1).
 
 ## Quickstart
 
@@ -71,6 +85,23 @@ You can swap the model by changing `model_name` in `model_runner.py`:
 ```python
 model_runner = ModelRunner(model_name="gpt2")  # lighter model for testing
 ```
+
+## Benchmarking
+
+`benchmark.py` measures the throughput difference between processing requests one-by-one vs. batching them together:
+
+```bash
+python benchmark.py
+```
+
+It runs 5 requests in two modes and reports wall-clock time and the speedup ratio:
+
+| Mode | Description |
+|---|---|
+| Sequential | Each request prefilled and decoded independently |
+| Batch | All requests prefilled together, decoded together each step |
+
+Batching wins by amortizing the high compute cost of prefill across multiple sequences and making better use of GPU memory bandwidth during decode.
 
 ## Key Concepts
 
