@@ -21,6 +21,7 @@ class Request:
         self.prompt_token_ids = None
         self.last_token_id = None
         self.past_key_values = None
+        self.kv_seq_len = 0
         self.generated_text = None
         self.completed = threading.Event()
         self.start_time = None

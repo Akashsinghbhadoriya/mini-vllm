@@ -3,6 +3,10 @@ from model_runner import ModelRunner
 from request import Request
 from scheduler import Scheduler
 from datetime import datetime
+import time
+import threading
+from client import client
+from server import Server
 
 prompts = [
     "What is artificial intelligence?",
@@ -44,10 +48,31 @@ def benchmark_batch():
     end = datetime.now()
     return (end - start).total_seconds()
 
+def continuous_batching():
+    threads = []
+    server = Server()
+    for prompt in prompts:
+        t = threading.Thread(
+            target=client,
+            args=(server, prompt)
+        )
+        threads.append(t)
+    start_time = time.time()
+    server.start()
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    end_time = time.time()
+    server.engine.stop()
+    return end_time - start_time
+
 def print_summary():
 
     t1 = benchmark_sequential()
     t2 = benchmark_batch()
+    t3 = continuous_batching()
     print("============================")
     print("Mini-vLLM Benchmark")
     print("============================")
@@ -57,6 +82,8 @@ def print_summary():
     print(f"Time:{t1} s")
     print("\nBatch\n")
     print(f"Time:{t2} s")
+    print("\nContinous Batching\n")
+    print(f"Time:{t3} s")
     print("\nSpeedup:", t1 / t2)
 
 
