@@ -6,6 +6,7 @@ from request_queue import RequestQueue
 from response_queue import ReponseQueue
 import threading
 import time
+from kv_cache_manager import KVCacheManager
 
 class Server:
 
@@ -14,11 +15,16 @@ class Server:
         self.response_queue = ReponseQueue()
         self.model_runner = ModelRunner()
         self.scheduler = Scheduler()
+        self.kv_manager = KVCacheManager(
+            num_blocks=1024,
+            block_size=16
+        )
         self.engine = Engine(
             self.model_runner,
             self.scheduler,
             self.request_queue,
-            self.response_queue
+            self.response_queue,
+            self.kv_manager
         )
         self.request_counter = 0
         self.counter_lock = threading.Lock()

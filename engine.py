@@ -4,7 +4,14 @@ import threading
 
 class Engine:
 
-    def __init__(self, model_runner, scheduler, request_queue = None, response_queue = None):
+    def __init__(
+            self, 
+            model_runner, 
+            scheduler, 
+            request_queue = None, 
+            response_queue = None,
+            kv_manager = None
+    ):
         
         self.model_runner = model_runner
         self.scheduler = scheduler
@@ -12,6 +19,7 @@ class Engine:
         self.request_queue = request_queue
         self.response_queue = response_queue
         self.model_runner.load_model()
+        self.kv_manager = kv_manager
 
     def start(self):
         self.running = True
@@ -73,7 +81,7 @@ class Engine:
                 new_requests = self.request_queue.dequeue_many(capacity)
                 if new_requests:
                     self.scheduler.add_active(new_requests)
-                    self.model_runner.prefill_batch(new_requests)
+                    self.model_runner.prefill_batch(new_requests) 
 
             if self.scheduler.has_active():
                 batch = self.scheduler.get_active()

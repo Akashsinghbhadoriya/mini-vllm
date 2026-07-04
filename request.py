@@ -1,5 +1,6 @@
 from enum import Enum, auto
 import threading
+from block_table import BlockTable
 
 class RequestStatus(Enum):
 
@@ -26,6 +27,7 @@ class Request:
         self.completed = threading.Event()
         self.start_time = None
         self.end_time = None
+        self.block_table = BlockTable()
 
     def mark_running(self):
         self.status = RequestStatus.RUNNING
