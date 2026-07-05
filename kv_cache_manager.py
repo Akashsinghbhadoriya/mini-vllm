@@ -41,7 +41,10 @@ class KVCacheManager:
 
         while num_tokens > 0:
 
-            block = self.allocate_block()
+            if block_table.total_capacity() > block_table.used_tokens():
+                block = block_table.last_block
+            else:
+                block = self.allocate_block()
 
             tokens = min(num_tokens, self.block_size)
 
@@ -51,7 +54,7 @@ class KVCacheManager:
 
     def free_request(self, block_table):
 
-        for block in block_table:
+        for block in block_table.blocks:
             self.free_block(block)
 
         block_table.clear()

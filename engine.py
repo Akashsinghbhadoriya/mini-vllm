@@ -81,17 +81,29 @@ class Engine:
                 new_requests = self.request_queue.dequeue_many(capacity)
                 if new_requests:
                     self.scheduler.add_active(new_requests)
-                    self.model_runner.prefill_batch(new_requests) 
+                    self.model_runner.prefill_batch(new_requests)
+                    for request in new_requests:
+                        self.kv_manager.allocate_for_request(
+                            request.block_table,
+                            request.kv_seq_len
+                        )
 
             if self.scheduler.has_active():
                 batch = self.scheduler.get_active()
 
                 self.model_runner.decode_batch(batch)
+                for request in batch:
+                    current_len = request.block_table.used_tokens() - request.kv_seq_len
+                    self.kv_manager.allocate_for_request(
+                        request.block_table,
+                        current_len
+                    )
                 finished_request = self.scheduler.remove_finished()
 
                 for request in finished_request:
                     self.decode_text(request)
                     self.response_queue.enqueue(request)
+                    self.kv_manager.free_request(request.block_table)
     
     def check_stop_conditions(self, request):
 
