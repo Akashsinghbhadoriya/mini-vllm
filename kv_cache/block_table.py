@@ -1,4 +1,4 @@
-from memory_block import MemoryBlock
+from kv_cache.memory_block import MemoryBlock
 
 class BlockTable:
 

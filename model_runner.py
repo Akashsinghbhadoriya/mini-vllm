@@ -2,6 +2,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, DynamicCache
 import torch
 from torch.nn import functional as F
 from request import RequestStatus
+from models.llama_model import LlamaModel
 
 class ModelRunner:
 
@@ -10,7 +11,8 @@ class ModelRunner:
         self.model_name = model_name 
 
     def load_model(self):
-        self.model = AutoModelForCausalLM.from_pretrained(self.model_name)
+        hf_model = AutoModelForCausalLM.from_pretrained(self.model_name)
+        self.model = LlamaModel(hf_model)
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
         self.eos_token_id = self.tokenizer.eos_token_id
         self.tokenizer.pad_token = self.tokenizer.eos_token
@@ -65,98 +67,141 @@ class ModelRunner:
     
     def prefill_batch(self, batch):
 
-        prompts = []
-        for request in batch:
-            prompts.append(request.prompt)
+        prompts = [r.prompt for r in batch]
         
         inputs = self.tokenizer(prompts, padding=True, return_tensors="pt")
 
         input_ids = inputs["input_ids"]
         attn_mask = inputs["attention_mask"]
 
-        outputs = self.model(
-            input_ids = input_ids,
-            attention_mask = attn_mask,
-            use_cache = True
-        )
+        position_ids = attn_mask.long().cumsum(-1) - 1
+        position_ids.masked_fill_(attn_mask == 0, 0)
+        logits, kv_caches = self.model(input_ids, position_ids, kv_caches=None)
+        batch_last_token = self.sample(logits)
+        # outputs = self.model(
+        #     input_ids = input_ids,
+        #     attention_mask = attn_mask,
+        #     use_cache = True
+        # )
 
-        batch_output_logits = outputs.logits
-        batch_past_key_values = outputs.past_key_values
-        batch_last_token_id = self.last_token_id(batch_output_logits)
+        # batch_output_logits = outputs.logits
+        # batch_past_key_values = outputs.past_key_values
+        # batch_last_token_id = self.last_token_id(batch_output_logits)
 
         for i, request in enumerate(batch):
 
-            next_token = batch_last_token_id[i].item()
-            request.generated_token_ids.append(next_token)
-            request.last_token_id = next_token
+            # next_token = batch_last_token_id[i].item()
+            # request.generated_token_ids.append(next_token)
+            # request.last_token_id = next_token
 
             valid_length = int(attn_mask[i].sum().item())
             request.prompt_token_ids = input_ids[i][:valid_length].tolist()
+            request.last_token_id = batch_last_token[i].item()
+            request.generated_token_ids.append(request.last_token_id)
 
-            request.past_key_values = tuple(
-                (k[:, :, :valid_length, :], v[:, :, :valid_length, :])
-                for k, v in self.extract_request_kv(batch_past_key_values, i)
-            )
+            # request.past_key_values = tuple(
+            #     (k[:, :, :valid_length, :], v[:, :, :valid_length, :])
+            #     for k, v in self.extract_request_kv(batch_past_key_values, i)
+            # )
+            request.kv_cache = [
+                (k[i:i+1, :, -valid_length:, :],
+                 v[i:i+1, :, -valid_length:, :])
+                 for k, v in kv_caches
+            ]
             request.kv_seq_len = valid_length
 
     def decode_batch(self, batch):
-
+        B = len(batch)
         last_tokens = [request.last_token_id for request in batch]
-        input_ids = torch.tensor(last_tokens).unsqueeze(1)
+        input_ids = torch.tensor(last_tokens)
 
         kv_seq_lens = [request.kv_seq_len for request in batch]
         max_kv_len = max(kv_seq_lens)
+        position_ids = torch.tensor([[kv_seq_len[i]] for i in range(B)])
 
-        batched_kv = DynamicCache()
-        num_layers = len(batch[0].past_key_values)
+        batched_kv = []
+        num_layers = len(batch[0].kv_cache)
+        
         for layer_idx in range(num_layers):
-            layer_keys = []
-            layer_values = []
-            for request, kv_seq_len in zip(batch, kv_seq_lens):
-                layer_k, layer_v = request.past_key_values[layer_idx]
-                # Strip left-padding accumulated from previous decode steps
-                tensor_len = layer_k.shape[2]
-                trim_start = tensor_len - kv_seq_len
-                layer_k = layer_k[:, :, trim_start:, :]
-                layer_v = layer_v[:, :, trim_start:, :]
-                # Left-pad shorter caches to max_kv_len
-                pad_len = max_kv_len - kv_seq_len
-                if pad_len > 0:
-                    layer_k = F.pad(layer_k, (0, 0, pad_len, 0))
-                    layer_v = F.pad(layer_v, (0, 0, pad_len, 0))
-                layer_keys.append(layer_k)
-                layer_values.append(layer_v)
-            batch_k = torch.cat(layer_keys, dim=0)
-            batch_v = torch.cat(layer_values, dim=0)
-            batched_kv.update(batch_k, batch_v, layer_idx)
-
-        # Attention mask: 0 for left-padding, 1 for real KV positions + new token
-        attention_mask = torch.zeros(len(batch), max_kv_len + 1)
-        for i, kv_seq_len in enumerate(kv_seq_lens):
-            attention_mask[i, max_kv_len - kv_seq_len:] = 1
-
-        outputs = self.model(
-            input_ids=input_ids,
-            past_key_values=batched_kv,
-            attention_mask=attention_mask,
-            use_cache=True
-        )
-
-        batch_output_logits = outputs.logits
-        batch_past_key_values = outputs.past_key_values
-        batch_last_token_id = self.last_token_id(batch_output_logits)
+            layer_keys, layer_vals = [], []
+            for i, request in enumerate(batch):
+                k, v = request.kv_cache[layer_idx]
+                pad = max_kv_len - kv_seq_lens[i]
+                if pad > 0:
+                    k = F.pad(k, (0, 0, pad, 0))
+                    v = F.pad(v, (0, 0, pad, 0))
+                layer_keys.append(k)
+                layer_vals.append(v)
+            batched_kv.append((
+                torch.cat(layer_keys, dim=0),
+                torch.cat(layer_vals, dim=0)
+            ))
+        
+        logits, new_kv_caches = self.model(input_ids, position_ids, kv_caches = batched_kv)
+        batch_last_token = self.sample(logits)
 
         for i, request in enumerate(batch):
-
-            next_token = batch_last_token_id[i].item()
+            next_token = batch_last_token[i].item()
             request.generated_token_ids.append(next_token)
             request.last_token_id = next_token
 
             if next_token == self.eos_token_id or len(request.generated_token_ids) >= request.max_new_tokens:
                 request.status = RequestStatus.FINISHED
 
-            request.past_key_values = tuple(self.extract_request_kv(batch_past_key_values, i))
+            request.kv_cache = [
+                (k[i:i+1, :, max_kv_len - kv_seq_lens[i]:, :],
+                 v[i:i+1, :, max_kv_len - kv_seq_lens[i]:, :])
+                 for k, v in new_kv_caches
+            ]
             request.kv_seq_len += 1
+        # for layer_idx in range(num_layers):
+        #     layer_keys = []
+        #     layer_values = []
+        #     for request, kv_seq_len in zip(batch, kv_seq_lens):
+        #         layer_k, layer_v = request.past_key_values[layer_idx]
+        #         # Strip left-padding accumulated from previous decode steps
+        #         tensor_len = layer_k.shape[2]
+        #         trim_start = tensor_len - kv_seq_len
+        #         layer_k = layer_k[:, :, trim_start:, :]
+        #         layer_v = layer_v[:, :, trim_start:, :]
+        #         # Left-pad shorter caches to max_kv_len
+        #         pad_len = max_kv_len - kv_seq_len
+        #         if pad_len > 0:
+        #             layer_k = F.pad(layer_k, (0, 0, pad_len, 0))
+        #             layer_v = F.pad(layer_v, (0, 0, pad_len, 0))
+        #         layer_keys.append(layer_k)
+        #         layer_values.append(layer_v)
+        #     batch_k = torch.cat(layer_keys, dim=0)
+        #     batch_v = torch.cat(layer_values, dim=0)
+        #     batched_kv.update(batch_k, batch_v, layer_idx)
+
+        # # Attention mask: 0 for left-padding, 1 for real KV positions + new token
+        # attention_mask = torch.zeros(len(batch), max_kv_len + 1)
+        # for i, kv_seq_len in enumerate(kv_seq_lens):
+        #     attention_mask[i, max_kv_len - kv_seq_len:] = 1
+
+        # outputs = self.model(
+        #     input_ids=input_ids,
+        #     past_key_values=batched_kv,
+        #     attention_mask=attention_mask,
+        #     use_cache=True
+        # )
+
+        # batch_output_logits = outputs.logits
+        # batch_past_key_values = outputs.past_key_values
+        # batch_last_token_id = self.last_token_id(batch_output_logits)
+
+        # for i, request in enumerate(batch):
+
+        #     next_token = batch_last_token_id[i].item()
+        #     request.generated_token_ids.append(next_token)
+        #     request.last_token_id = next_token
+
+        #     if next_token == self.eos_token_id or len(request.generated_token_ids) >= request.max_new_tokens:
+        #         request.status = RequestStatus.FINISHED
+
+        #     request.past_key_values = tuple(self.extract_request_kv(batch_past_key_values, i))
+        #     request.kv_seq_len += 1
 
 
     def extract_request_kv(self, batch_past_key_values, batch_index):
@@ -177,6 +222,11 @@ class ModelRunner:
         last_token_id = torch.multinomial(probs, num_samples = 1)
 
         return last_token_id
+    
+    def sample(self, logits):
+        last_logits = logits[:, -1, :]
+        probs = F.softmax(last_logits, dim=-1)
+        return torch.multinomial(probs, num_samples=1).squeeze(1)
 
 
         

@@ -6,7 +6,7 @@ from request_queue import RequestQueue
 from response_queue import ReponseQueue
 import threading
 import time
-from kv_cache_manager import KVCacheManager
+from kv_cache.kv_cache_manager import KVCacheManager
 
 class Server:
 

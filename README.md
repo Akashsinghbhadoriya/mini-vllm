@@ -175,13 +175,17 @@ Batching wins by amortizing the high compute cost of prefill across multiple seq
 
 See [`vllm.md`](./vllm.md) for notes on the prefill vs decode distinction, and [`PagedAttention.md`](./PagedAttention.md) for how vLLM extends this with paged memory management.
 
+## KV Cache Manager
+
+This phase implements a block-based KV cache manager inspired by vLLM. Since inference is still executed using Hugging Face's native attention implementation, the block manager operates alongside the existing `past_key_values` cache rather than replacing it. Consequently, this phase focuses on reproducing the architecture and memory management concepts rather than achieving the same performance characteristics as vLLM.
+
 ## What's Missing (vs Real vLLM)
 
 This is intentionally minimal. Real vLLM adds:
 
 | Feature | Status |
 |---|---|
-| PagedAttention (non-contiguous KV blocks) | Not implemented |
+| PagedAttention (non-contiguous KV blocks) | Partially implemented (block manager architecture) |
 | Continuous batching | Implemented (basic) |
 | Async engine / API server | Partially implemented (threaded Server) |
 | GPU memory pre-allocation | Not implemented |
