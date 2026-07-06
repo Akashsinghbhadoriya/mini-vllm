@@ -1,7 +1,7 @@
 from transformers import AutoTokenizer, AutoModelForCausalLM, DynamicCache
 import torch
 from torch.nn import functional as F
-from request import RequestStatus
+from request.request import RequestStatus
 from models.llama_model import LlamaModel
 
 class ModelRunner:
@@ -113,11 +113,11 @@ class ModelRunner:
     def decode_batch(self, batch):
         B = len(batch)
         last_tokens = [request.last_token_id for request in batch]
-        input_ids = torch.tensor(last_tokens)
+        input_ids = torch.tensor(last_tokens).unsqueeze(1)  # [B] -> [B, 1]
 
         kv_seq_lens = [request.kv_seq_len for request in batch]
         max_kv_len = max(kv_seq_lens)
-        position_ids = torch.tensor([[kv_seq_len[i]] for i in range(B)])
+        position_ids = torch.tensor([[kv_seq_lens[i]] for i in range(B)])
 
         batched_kv = []
         num_layers = len(batch[0].kv_cache)

@@ -1,4 +1,4 @@
-from request import RequestStatus
+from request.request import RequestStatus
 
 class Scheduler:
 

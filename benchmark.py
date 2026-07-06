@@ -1,12 +1,12 @@
-from engine import Engine
-from model_runner import ModelRunner
-from request import Request
-from scheduler import Scheduler
+from core.engine import Engine
+from core.model_runner import ModelRunner
+from request.request import Request
+from core.scheduler import Scheduler
 from datetime import datetime
 import time
 import threading
 from client import client
-from server import Server
+from core.server import Server
 
 prompts = [
     "What is artificial intelligence?",

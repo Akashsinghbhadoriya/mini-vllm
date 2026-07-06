@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 from models.llama_decoder import LlamaDecoderLayer
 from attention.attention import Attention
+from attention.paged_attention import PagedAttention
 
 class LlamaModel(nn.Module):
 
@@ -15,7 +16,7 @@ class LlamaModel(nn.Module):
         config = hf_model.config
 
         self.layers = nn.ModuleList([
-            LlamaDecoderLayer(layer, Attention(layer.self_attn, rotary_emb, config))
+            LlamaDecoderLayer(layer, PagedAttention(layer.self_attn, rotary_emb, config))
             for layer in hf.layers
         ])
 
