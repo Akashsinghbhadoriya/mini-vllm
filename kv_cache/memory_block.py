@@ -1,4 +1,5 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Optional
 
 @dataclass
 class MemoryBlock:
@@ -7,7 +8,9 @@ class MemoryBlock:
     capacity: int
     used_tokens: int = 0
     is_allocated: bool = False
-
+    ref_count: int = 0
+    token_hash: Optional[int] = None
+    layer_kv: dict = field(default_factory=dict)
     k_cache = None
     v_cache = None
 
@@ -26,6 +29,9 @@ class MemoryBlock:
 
         self.used_tokens = 0
         self.is_allocated = False
+        self.ref_count = 0
+        self.token_hash = None
+        self.layer_kv = {}
 
         self.k_cache = None
         self.v_cache = None

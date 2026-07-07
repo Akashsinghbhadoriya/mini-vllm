@@ -81,11 +81,32 @@ class Engine:
                 new_requests = self.request_queue.dequeue_many(capacity)
                 if new_requests:
                     self.scheduler.add_active(new_requests)
+
+                    # Tokenize first so prefix lookup has token ids
+                    self.model_runner.tokenize_batch(new_requests)
+
+                    # Prefix cache lookup: pre-populate block_table with cached blocks
+                    for request in new_requests:
+                        cached_blocks = self.kv_manager.lookup_prefix(request.prompt_token_ids)
+                        request.cached_prefix_len = len(cached_blocks) * self.kv_manager.block_size
+                        for block in cached_blocks:
+                            request.block_table.append(block)
+
+                    # Prefill: skips cached prefix for cache-hit requests
                     self.model_runner.prefill_batch(new_requests)
+
+                    # Allocate new blocks for the suffix (cached blocks already in block_table)
                     for request in new_requests:
                         self.kv_manager.allocate_for_request(
                             request.block_table,
                             request.kv_seq_len
+                        )
+
+                    # Write KV tensors into blocks, then cache completed full blocks
+                    for request in new_requests:
+                        self.kv_manager.write_kv_to_blocks(request.block_table, request.kv_cache)
+                        self.kv_manager.cache_completed_blocks(
+                            request.block_table, request.prompt_token_ids
                         )
 
             if self.scheduler.has_active():

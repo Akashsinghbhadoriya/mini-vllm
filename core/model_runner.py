@@ -16,7 +16,18 @@ class ModelRunner:
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
         self.eos_token_id = self.tokenizer.eos_token_id
         self.tokenizer.pad_token = self.tokenizer.eos_token
-    
+
+    def tokenize_batch(self, batch):
+        """Tokenize prompts and store plain token-id lists on each request."""
+        prompts = [r.prompt for r in batch]
+        inputs = self.tokenizer(prompts, padding=True, return_tensors="pt")
+        input_ids = inputs["input_ids"]
+        attn_mask = inputs["attention_mask"]
+        for i, request in enumerate(batch):
+            valid_length = int(attn_mask[i].sum().item())
+            request.prompt_token_ids = input_ids[i][:valid_length].tolist()
+
+
     def prefill(self, request):
 
         inputs = self.tokenizer(request.prompt, return_tensors="pt")
@@ -66,49 +77,133 @@ class ModelRunner:
         )
     
     def prefill_batch(self, batch):
+        no_cache = [r for r in batch if r.cached_prefix_len == 0]
+        has_cache = [r for r in batch if r.cached_prefix_len > 0]
 
-        prompts = [r.prompt for r in batch]
-        
-        inputs = self.tokenizer(prompts, padding=True, return_tensors="pt")
+        if no_cache:
+            prompts = [r.prompt for r in no_cache]
+            inputs = self.tokenizer(prompts, padding=True, return_tensors="pt")
+            input_ids = inputs["input_ids"]
+            attn_mask = inputs["attention_mask"]
+            position_ids = attn_mask.long().cumsum(-1) - 1
+            position_ids.masked_fill_(attn_mask == 0, 0)
+            logits, kv_caches = self.model(input_ids, position_ids, kv_caches=None)
+            batch_last_token = self.sample(logits)
 
-        input_ids = inputs["input_ids"]
-        attn_mask = inputs["attention_mask"]
+            for i, request in enumerate(no_cache):
+                valid_length = int(attn_mask[i].sum().item())
+                request.prompt_token_ids = input_ids[i][:valid_length].tolist()
+                request.last_token_id = batch_last_token[i].item()
+                request.generated_token_ids.append(request.last_token_id)
+                request.kv_cache = [
+                    (k[i:i+1, :, -valid_length:, :],
+                     v[i:i+1, :, -valid_length:, :])
+                    for k, v in kv_caches
+                ]
+                request.kv_seq_len = valid_length
 
-        position_ids = attn_mask.long().cumsum(-1) - 1
-        position_ids.masked_fill_(attn_mask == 0, 0)
-        logits, kv_caches = self.model(input_ids, position_ids, kv_caches=None)
-        batch_last_token = self.sample(logits)
-        # outputs = self.model(
-        #     input_ids = input_ids,
-        #     attention_mask = attn_mask,
-        #     use_cache = True
-        # )
+        # Separate fully-cached requests (edge case) from partial-cache hits
+        fully_cached = [r for r in has_cache
+                        if len(r.prompt_token_ids[r.cached_prefix_len:]) == 0]
+        partial_cached = [r for r in has_cache
+                          if len(r.prompt_token_ids[r.cached_prefix_len:]) > 0]
 
-        # batch_output_logits = outputs.logits
-        # batch_past_key_values = outputs.past_key_values
-        # batch_last_token_id = self.last_token_id(batch_output_logits)
+        for request in fully_cached:
+            self._prefill_with_prefix_cache(request)
 
-        for i, request in enumerate(batch):
+        # Group partial-cache requests by (cached block IDs, suffix length)
+        # so each group can be prefilled in a single batched forward pass
+        groups: dict = {}
+        for r in partial_cached:
+            suffix_len = len(r.prompt_token_ids) - r.cached_prefix_len
+            key = (tuple(b.block_id for b in r.block_table.blocks), suffix_len)
+            groups.setdefault(key, []).append(r)
 
-            # next_token = batch_last_token_id[i].item()
-            # request.generated_token_ids.append(next_token)
-            # request.last_token_id = next_token
+        for group in groups.values():
+            self._prefill_batch_with_prefix_cache(group)
 
-            valid_length = int(attn_mask[i].sum().item())
-            request.prompt_token_ids = input_ids[i][:valid_length].tolist()
-            request.last_token_id = batch_last_token[i].item()
+    def _prefill_with_prefix_cache(self, request):
+        """Run the model only on suffix tokens, reusing cached prefix KV."""
+        cached_blocks = request.block_table.blocks
+        num_layers = len(cached_blocks[0].layer_kv)
+        cached_prefix_len = request.cached_prefix_len
+
+        # Reconstruct per-layer cached KV by concatenating blocks
+        cached_kv = []
+        for layer_idx in range(num_layers):
+            k_chunks = [b.layer_kv[layer_idx][0] for b in cached_blocks]
+            v_chunks = [b.layer_kv[layer_idx][1] for b in cached_blocks]
+            cached_kv.append((
+                torch.cat(k_chunks, dim=2),
+                torch.cat(v_chunks, dim=2)
+            ))
+
+        suffix_ids = request.prompt_token_ids[cached_prefix_len:]
+
+        # Edge case: whole prompt is cached — peel last token to get fresh logits
+        if len(suffix_ids) == 0:
+            suffix_ids = [request.prompt_token_ids[-1]]
+            cached_kv = [(k[:, :, :-1, :], v[:, :, :-1, :]) for k, v in cached_kv]
+            cached_prefix_len -= 1
+
+        input_ids = torch.tensor([suffix_ids])
+        position_ids = torch.arange(
+            cached_prefix_len,
+            cached_prefix_len + len(suffix_ids)
+        ).unsqueeze(0)
+
+        # PagedAttention sees cached_kv as tuple → tensor KV path; cats internally
+        logits, new_kv_caches = self.model(input_ids, position_ids, kv_caches=cached_kv)
+
+        # new_kv_caches already holds full accumulated KV (cached prefix + suffix)
+        request.kv_cache = [(k[0:1], v[0:1]) for k, v in new_kv_caches]
+        request.kv_seq_len = cached_prefix_len + len(suffix_ids)
+        request.last_token_id = self.sample(logits)[0].item()
+        request.generated_token_ids.append(request.last_token_id)
+
+    def _prefill_batch_with_prefix_cache(self, requests):
+        """Batch-prefill requests that share the same cached prefix blocks and suffix length."""
+        rep = requests[0]
+        cached_blocks = rep.block_table.blocks
+        num_layers = len(cached_blocks[0].layer_kv)
+        cached_prefix_len = rep.cached_prefix_len
+
+        # Build cached_kv once — all requests in this group share identical cached blocks
+        cached_kv = []
+        for layer_idx in range(num_layers):
+            k_chunks = [b.layer_kv[layer_idx][0] for b in cached_blocks]
+            v_chunks = [b.layer_kv[layer_idx][1] for b in cached_blocks]
+            cached_kv.append((
+                torch.cat(k_chunks, dim=2),
+                torch.cat(v_chunks, dim=2),
+            ))
+
+        suffix_lists = [r.prompt_token_ids[r.cached_prefix_len:] for r in requests]
+        suffix_len = len(suffix_lists[0])  # same for all by construction
+        B = len(requests)
+
+        input_ids = torch.tensor(suffix_lists)  # [B, suffix_len]
+        position_ids = torch.arange(
+            cached_prefix_len, cached_prefix_len + suffix_len
+        ).unsqueeze(0).expand(B, -1)  # [B, suffix_len]
+
+        # Expand cached_kv from [1, heads, cached_len, head_dim] to [B, ...]
+        batched_cached_kv = [
+            (k.expand(B, -1, -1, -1), v.expand(B, -1, -1, -1))
+            for k, v in cached_kv
+        ]
+
+        logits, new_kv_caches = self.model(input_ids, position_ids, kv_caches=batched_cached_kv)
+        sampled = self.sample(logits)  # [B]
+
+        for i, request in enumerate(requests):
+            request.last_token_id = sampled[i].item()
             request.generated_token_ids.append(request.last_token_id)
-
-            # request.past_key_values = tuple(
-            #     (k[:, :, :valid_length, :], v[:, :, :valid_length, :])
-            #     for k, v in self.extract_request_kv(batch_past_key_values, i)
-            # )
             request.kv_cache = [
-                (k[i:i+1, :, -valid_length:, :],
-                 v[i:i+1, :, -valid_length:, :])
-                 for k, v in kv_caches
+                (k[i:i+1], v[i:i+1])
+                for k, v in new_kv_caches
             ]
-            request.kv_seq_len = valid_length
+            request.kv_seq_len = cached_prefix_len + suffix_len
 
     def decode_batch(self, batch):
         B = len(batch)

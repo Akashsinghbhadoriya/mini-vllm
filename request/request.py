@@ -29,6 +29,7 @@ class Request:
         self.end_time = None
         self.block_table = BlockTable()
         self.kv_cache = None
+        self.cached_prefix_len: int = 0
 
     def mark_running(self):
         self.status = RequestStatus.RUNNING
