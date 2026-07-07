@@ -2,6 +2,8 @@ from request.request import RequestStatus
 import torch
 import threading
 
+STREAM_DONE = object()
+
 class Engine:
 
     def __init__(
@@ -97,6 +99,9 @@ class Engine:
 
                     # Allocate new blocks for the suffix (cached blocks already in block_table)
                     for request in new_requests:
+                        if request.streaming:
+                            token = self.model_runner.decode_single_token(request.last_token_id)
+                            request.token_queue.put(token)
                         self.kv_manager.allocate_for_request(
                             request.block_table,
                             request.kv_seq_len
@@ -114,6 +119,9 @@ class Engine:
 
                 self.model_runner.decode_batch(batch)
                 for request in batch:
+                    if request.streaming:
+                        token = self.model_runner.decode_single_token(request.last_token_id)
+                        request.token_queue.put(token)
                     current_len = request.block_table.used_tokens() - request.kv_seq_len
                     self.kv_manager.allocate_for_request(
                         request.block_table,
@@ -145,4 +153,6 @@ class Engine:
         token_ids = request.prompt_token_ids + request.generated_token_ids
         text = self.model_runner.decode_tokens(token_ids)
         request.generated_text = text
+        if request.streaming:
+            request.token_queue.put(STREAM_DONE)
         request.completed.set()

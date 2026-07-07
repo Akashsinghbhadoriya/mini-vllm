@@ -1,6 +1,7 @@
 from enum import Enum, auto
 import threading
 from kv_cache.block_table import BlockTable
+import queue
 
 class RequestStatus(Enum):
 
@@ -11,7 +12,14 @@ class RequestStatus(Enum):
     FAILED = auto()
 
 class Request:
-    def __init__(self, requestId, prompt, max_new_tokens=50, status: RequestStatus = RequestStatus.STARTED):
+    def __init__(self, 
+                 requestId, 
+                 prompt, 
+                 max_new_tokens=50, 
+                 status: RequestStatus = RequestStatus.STARTED,
+                 streaming: bool = False,
+                 token_queue: queue.Queue | None = None
+        ):
         super().__init__()
 
         self.request_id = requestId
@@ -30,6 +38,9 @@ class Request:
         self.block_table = BlockTable()
         self.kv_cache = None
         self.cached_prefix_len: int = 0
+        self.streaming = streaming
+        if streaming:
+            self.token_queue = queue.Queue()
 
     def mark_running(self):
         self.status = RequestStatus.RUNNING

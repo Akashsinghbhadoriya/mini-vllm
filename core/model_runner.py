@@ -322,6 +322,9 @@ class ModelRunner:
         last_logits = logits[:, -1, :]
         probs = F.softmax(last_logits, dim=-1)
         return torch.multinomial(probs, num_samples=1).squeeze(1)
+    
+    def decode_single_token(self, token_id: int) -> str:
+        return self.tokenizer.decode([token_id], skip_special_tokens=True)
 
 
         

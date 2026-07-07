@@ -1,12 +1,14 @@
 from core.engine import Engine
 from core.model_runner import ModelRunner
 from request.request import Request
+from request.handle import RequestHandle
 from core.scheduler import Scheduler
 from request.request_queue import RequestQueue
 from request.response_queue import ReponseQueue
 import threading
 import time
 from kv_cache.kv_cache_manager import KVCacheManager
+
 
 class Server:
 
@@ -50,3 +52,16 @@ class Server:
 
         latency = request.end_time - request.start_time
         return request.generated_text, request_id, latency
+    
+    def submit(self, prompt, max_new_tokens, streaming=False):
+
+        with self.counter_lock:
+            request_id = ++self.request_counter
+            request = Request(request_id, 
+                              prompt, 
+                              max_new_tokens,
+                              streaming=streaming
+            )
+            request.start_time = time.time()
+            self.request_queue.enqueue(request)
+            return RequestHandle(request)
