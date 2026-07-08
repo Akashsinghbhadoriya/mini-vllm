@@ -1,8 +1,16 @@
 from pydantic import BaseModel
 from typing import Literal, Optional
 
+class InferenceMetrics(BaseModel):
+    ttft_ms: float
+    latency_ms: float
+    tokens_per_sec: float
+    prefix_cache: str
+    kv_blocks: int
+    batch_id: int
+
 class CompletionRequest(BaseModel):
-    model: str
+    model: str = "miniVllm"
     prompt: str
     max_tokens: int = 128
     stream: bool = False
@@ -13,7 +21,7 @@ class ChatMessage(BaseModel):
     content: str
 
 class ChatCompletionRequest(BaseModel):
-    model: str
+    model: str = "miniVllm"
     messages: list[ChatMessage]
     max_tokens: int = 128
     stream: bool = False
@@ -31,12 +39,13 @@ class CompletionChoice(BaseModel):
     finish_reason: str = "stop"
                                                                 
 class CompletionResponse(BaseModel):
-    id: str                                                     
-    object: str = "text_completion"                   
-    created: int                               
-    model: str                                                 
+    id: str
+    object: str = "text_completion"
+    created: int
+    model: str
     choices: list[CompletionChoice]
     usage: UsageInfo
+    metrics: Optional[InferenceMetrics] = None
 
 class ChatCompletionMessage(BaseModel):                         
     role: str = "assistant"
@@ -48,12 +57,13 @@ class ChatCompletionChoice(BaseModel):
     finish_reason: str = "stop"
                                                                 
 class ChatCompletionResponse(BaseModel):
-    id: str                                                     
-    object: str = "chat.completion"                   
-    created: int                               
-    model: str                                                 
+    id: str
+    object: str = "chat.completion"
+    created: int
+    model: str
     choices: list[ChatCompletionChoice]
     usage: UsageInfo
+    metrics: Optional[InferenceMetrics] = None
 
 # --- SSE streaming chunks ---                                  
 class DeltaContent(BaseModel):                                  

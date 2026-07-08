@@ -35,10 +35,18 @@ class Request:
         self.completed = threading.Event()
         self.start_time = None
         self.end_time = None
+        self.first_token_time = None
         self.block_table = BlockTable()
         self.kv_cache = None
         self.cached_prefix_len: int = 0
         self.streaming = streaming
+        # Per-phase timing accumulators (seconds)
+        self.t_tokenize = 0.0
+        self.t_prefix_lookup = 0.0
+        self.t_prefill = 0.0
+        self.t_kv_write = 0.0
+        self.t_decode_total = 0.0
+        self.n_decode_steps = 0
         if streaming:
             self.token_queue = queue.Queue()
 

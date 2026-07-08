@@ -7,7 +7,7 @@ import uuid
 from api.schemas import (
     CompletionRequest, CompletionResponse, CompletionChoice,
     ChatCompletionRequest, ChatCompletionResponse, ChatCompletionChoice,
-    ChatCompletionMessage, UsageInfo
+    ChatCompletionMessage, UsageInfo, InferenceMetrics
 )
 from api.stream import token_stream_generator
 
@@ -52,9 +52,19 @@ async def completions(body: CompletionRequest, server=Depends(get_server)):
 
     if not body.stream:
         loop = asyncio.get_event_loop()
-        text, req_id, _ = await loop.run_in_executor(None, handle.wait)
-        prompt_tokens = len(handle._request.prompt_token_ids or [])
-        completion_tokens = len(handle._request.generated_token_ids)
+        text, req_id, latency = await loop.run_in_executor(None, handle.wait)
+        req = handle._request
+        prompt_tokens = len(req.prompt_token_ids or [])
+        completion_tokens = len(req.generated_token_ids)
+        ttft_ms = ((req.first_token_time or time.time()) - req.start_time) * 1000
+        metrics = InferenceMetrics(
+            ttft_ms=round(ttft_ms, 1),
+            latency_ms=round(latency * 1000, 1),
+            tokens_per_sec=round(completion_tokens / latency, 1) if latency > 0 else 0.0,
+            prefix_cache="HIT" if req.cached_prefix_len > 0 else "MISS",
+            kv_blocks=req.block_table.num_blocks(),
+            batch_id=req.request_id,
+        )
         return CompletionResponse(
             id=chunk_id,
             created=int(time.time()),
@@ -64,7 +74,8 @@ async def completions(body: CompletionRequest, server=Depends(get_server)):
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
                 total_tokens=prompt_tokens + completion_tokens,
-            )
+            ),
+            metrics=metrics,
         )
 
     generator = token_stream_generator(handle, chunk_id, body.model, is_chat=False)
@@ -79,9 +90,19 @@ async def chat_completions(body: ChatCompletionRequest, server=Depends(get_serve
 
     if not body.stream:
         loop = asyncio.get_event_loop()
-        text, req_id, _ = await loop.run_in_executor(None, handle.wait)
-        prompt_tokens = len(handle._request.prompt_token_ids or [])
-        completion_tokens = len(handle._request.generated_token_ids)
+        text, req_id, latency = await loop.run_in_executor(None, handle.wait)
+        req = handle._request
+        prompt_tokens = len(req.prompt_token_ids or [])
+        completion_tokens = len(req.generated_token_ids)
+        ttft_ms = ((req.first_token_time or time.time()) - req.start_time) * 1000
+        metrics = InferenceMetrics(
+            ttft_ms=round(ttft_ms, 1),
+            latency_ms=round(latency * 1000, 1),
+            tokens_per_sec=round(completion_tokens / latency, 1) if latency > 0 else 0.0,
+            prefix_cache="HIT" if req.cached_prefix_len > 0 else "MISS",
+            kv_blocks=req.block_table.num_blocks(),
+            batch_id=req.request_id,
+        )
         return ChatCompletionResponse(
             id=chunk_id,
             created=int(time.time()),
@@ -93,7 +114,8 @@ async def chat_completions(body: ChatCompletionRequest, server=Depends(get_serve
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
                 total_tokens=prompt_tokens + completion_tokens,
-            )
+            ),
+            metrics=metrics,
         )
 
     generator = token_stream_generator(handle, chunk_id, body.model, is_chat=True)

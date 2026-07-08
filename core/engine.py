@@ -1,6 +1,7 @@
 from request.request import RequestStatus
 import torch
 import threading
+import time
 
 STREAM_DONE = object()
 
@@ -85,20 +86,35 @@ class Engine:
                     self.scheduler.add_active(new_requests)
 
                     # Tokenize first so prefix lookup has token ids
+                    _t0 = time.time()
                     self.model_runner.tokenize_batch(new_requests)
+                    _dt = time.time() - _t0
+                    for r in new_requests:
+                        r.t_tokenize += _dt
 
                     # Prefix cache lookup: pre-populate block_table with cached blocks
+                    _t0 = time.time()
                     for request in new_requests:
                         cached_blocks = self.kv_manager.lookup_prefix(request.prompt_token_ids)
                         request.cached_prefix_len = len(cached_blocks) * self.kv_manager.block_size
                         for block in cached_blocks:
                             request.block_table.append(block)
+                    _dt = time.time() - _t0
+                    for r in new_requests:
+                        r.t_prefix_lookup += _dt
 
                     # Prefill: skips cached prefix for cache-hit requests
+                    _t0 = time.time()
                     self.model_runner.prefill_batch(new_requests)
+                    _dt = time.time() - _t0
+                    for r in new_requests:
+                        r.t_prefill += _dt
 
                     # Allocate new blocks for the suffix (cached blocks already in block_table)
+                    _t0 = time.time()
                     for request in new_requests:
+                        if request.first_token_time is None:
+                            request.first_token_time = time.time()
                         if request.streaming:
                             token = self.model_runner.decode_single_token(request.last_token_id)
                             request.token_queue.put(token)
@@ -113,11 +129,19 @@ class Engine:
                         self.kv_manager.cache_completed_blocks(
                             request.block_table, request.prompt_token_ids
                         )
+                    _dt = time.time() - _t0
+                    for r in new_requests:
+                        r.t_kv_write += _dt
 
             if self.scheduler.has_active():
                 batch = self.scheduler.get_active()
 
+                _t0 = time.time()
                 self.model_runner.decode_batch(batch)
+                _dt = time.time() - _t0
+                for request in batch:
+                    request.t_decode_total += _dt
+                    request.n_decode_steps += 1
                 for request in batch:
                     if request.streaming:
                         token = self.model_runner.decode_single_token(request.last_token_id)
@@ -131,6 +155,20 @@ class Engine:
 
                 for request in finished_request:
                     self.decode_text(request)
+                    _total = time.time() - request.start_time
+                    _steps = request.n_decode_steps or 1
+                    print(
+                        f"\n[TIMING] request_id={request.request_id}\n"
+                        f"  tokenize:      {request.t_tokenize*1000:.1f}ms\n"
+                        f"  prefix_lookup: {request.t_prefix_lookup*1000:.1f}ms\n"
+                        f"  prefill:       {request.t_prefill*1000:.1f}ms\n"
+                        f"  kv_write:      {request.t_kv_write*1000:.1f}ms\n"
+                        f"  decode_total:  {request.t_decode_total*1000:.1f}ms  "
+                        f"({request.n_decode_steps} steps, "
+                        f"{request.t_decode_total/_steps*1000:.1f}ms/step)\n"
+                        f"  total_wall:    {_total*1000:.1f}ms",
+                        flush=True
+                    )
                     self.response_queue.enqueue(request)
                     self.kv_manager.free_request(request.block_table)
     

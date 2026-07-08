@@ -11,11 +11,15 @@ class ModelRunner:
         self.model_name = model_name 
 
     def load_model(self):
-        hf_model = AutoModelForCausalLM.from_pretrained(self.model_name)
+        self.device = torch.device("cpu")
+        hf_model = AutoModelForCausalLM.from_pretrained(
+            self.model_name, torch_dtype=torch.bfloat16
+        )
         self.model = LlamaModel(hf_model)
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
         self.eos_token_id = self.tokenizer.eos_token_id
         self.tokenizer.pad_token = self.tokenizer.eos_token
+        print(f"Model loaded on {self.device} (bfloat16)")
 
     def tokenize_batch(self, batch):
         """Tokenize prompts and store plain token-id lists on each request."""
@@ -76,6 +80,7 @@ class ModelRunner:
             skip_special_tokens=True
         )
     
+    @torch.inference_mode()
     def prefill_batch(self, batch):
         no_cache = [r for r in batch if r.cached_prefix_len == 0]
         has_cache = [r for r in batch if r.cached_prefix_len > 0]
@@ -83,8 +88,8 @@ class ModelRunner:
         if no_cache:
             prompts = [r.prompt for r in no_cache]
             inputs = self.tokenizer(prompts, padding=True, return_tensors="pt")
-            input_ids = inputs["input_ids"]
-            attn_mask = inputs["attention_mask"]
+            input_ids = inputs["input_ids"].to(self.device)
+            attn_mask = inputs["attention_mask"].to(self.device)
             position_ids = attn_mask.long().cumsum(-1) - 1
             position_ids.masked_fill_(attn_mask == 0, 0)
             logits, kv_caches = self.model(input_ids, position_ids, kv_caches=None)
@@ -122,6 +127,7 @@ class ModelRunner:
         for group in groups.values():
             self._prefill_batch_with_prefix_cache(group)
 
+    @torch.inference_mode()
     def _prefill_with_prefix_cache(self, request):
         """Run the model only on suffix tokens, reusing cached prefix KV."""
         cached_blocks = request.block_table.blocks
@@ -146,10 +152,11 @@ class ModelRunner:
             cached_kv = [(k[:, :, :-1, :], v[:, :, :-1, :]) for k, v in cached_kv]
             cached_prefix_len -= 1
 
-        input_ids = torch.tensor([suffix_ids])
+        input_ids = torch.tensor([suffix_ids], device=self.device)
         position_ids = torch.arange(
             cached_prefix_len,
-            cached_prefix_len + len(suffix_ids)
+            cached_prefix_len + len(suffix_ids),
+            device=self.device
         ).unsqueeze(0)
 
         # PagedAttention sees cached_kv as tuple → tensor KV path; cats internally
@@ -161,6 +168,7 @@ class ModelRunner:
         request.last_token_id = self.sample(logits)[0].item()
         request.generated_token_ids.append(request.last_token_id)
 
+    @torch.inference_mode()
     def _prefill_batch_with_prefix_cache(self, requests):
         """Batch-prefill requests that share the same cached prefix blocks and suffix length."""
         rep = requests[0]
@@ -182,9 +190,9 @@ class ModelRunner:
         suffix_len = len(suffix_lists[0])  # same for all by construction
         B = len(requests)
 
-        input_ids = torch.tensor(suffix_lists)  # [B, suffix_len]
+        input_ids = torch.tensor(suffix_lists, device=self.device)  # [B, suffix_len]
         position_ids = torch.arange(
-            cached_prefix_len, cached_prefix_len + suffix_len
+            cached_prefix_len, cached_prefix_len + suffix_len, device=self.device
         ).unsqueeze(0).expand(B, -1)  # [B, suffix_len]
 
         # Expand cached_kv from [1, heads, cached_len, head_dim] to [B, ...]
@@ -205,14 +213,15 @@ class ModelRunner:
             ]
             request.kv_seq_len = cached_prefix_len + suffix_len
 
+    @torch.inference_mode()
     def decode_batch(self, batch):
         B = len(batch)
         last_tokens = [request.last_token_id for request in batch]
-        input_ids = torch.tensor(last_tokens).unsqueeze(1)  # [B] -> [B, 1]
+        input_ids = torch.tensor(last_tokens, device=self.device).unsqueeze(1)  # [B] -> [B, 1]
 
         kv_seq_lens = [request.kv_seq_len for request in batch]
         max_kv_len = max(kv_seq_lens)
-        position_ids = torch.tensor([[kv_seq_lens[i]] for i in range(B)])
+        position_ids = torch.tensor([[kv_seq_lens[i]] for i in range(B)], device=self.device)
 
         batched_kv = []
         num_layers = len(batch[0].kv_cache)
