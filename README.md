@@ -15,6 +15,10 @@ vLLM achieves up to 24x better throughput than naive HuggingFace inference by re
 - **Custom attention** — multi-head attention with RoPE and GQA support, replacing the HuggingFace attention layer
 - **Paged attention** — block-based KV cache management inspired by vLLM's PagedAttention
 - **KV cache manager** — global memory pool of fixed-size blocks, allocated per-request and freed on completion
+- **Prefix caching** — LRU cache of completed KV blocks matched by token prefix, avoids redundant prefill compute for shared prompt prefixes
+- **OpenAI-compatible REST API** — `/v1/completions`, `/v1/chat/completions`, and `/metrics` endpoints via FastAPI
+- **Streaming** — SSE token streaming with per-chunk inference metrics
+- **Visualization dashboard** — multi-user Streamlit UI with real-time streaming and per-request metrics
 - **Server / Client** — thread-safe server that accepts concurrent client requests and tracks per-request latency
 
 ## Project Structure
@@ -24,7 +28,7 @@ miniVllm/
 ├── main.py                    # Entry point — spawns concurrent client threads against the Server
 ├── client.py                  # Client: submits a prompt to the server and prints the response + latency
 ├── benchmark.py               # Benchmarks sequential vs batch vs continuous batching throughput
-├── inspect_forward.py         # Scratch file for exploring model forward pass outputs
+├── ui.py                      # Streamlit multi-user inference dashboard (requires API running)
 │
 ├── core/
 │   ├── server.py              # Server: wraps Engine with a thread-safe submit interface + latency tracking
@@ -34,6 +38,7 @@ miniVllm/
 │
 ├── request/
 │   ├── request.py             # Request dataclass + RequestStatus enum
+│   ├── handle.py              # Async/streaming request handle with token-by-token yield
 │   ├── request_queue.py       # Thread-safe inbound request queue (deque + lock)
 │   └── response_queue.py      # Thread-safe outbound response queue (deque + lock)
 │
@@ -45,18 +50,98 @@ miniVllm/
 ├── kv_cache/
 │   ├── memory_block.py        # Fixed-size KV block (single unit of preallocated memory)
 │   ├── block_table.py         # Per-request mapping: logical sequence → physical blocks
-│   └── kv_cache_manager.py    # Global block pool: allocate, free, track stats
+│   ├── kv_cache_manager.py    # Global block pool: allocate, free, prefix lookup, track stats
+│   └── prefix_cache.py        # LRU cache of completed KV blocks keyed by token prefix hash
 │
 ├── models/
 │   ├── llama_model.py         # Custom LlamaForCausalLM wrapper with pluggable attention
 │   └── llama_decoder.py       # Single transformer layer: pre-norm attention + MLP
 │
+├── api/
+│   ├── app.py                 # FastAPI app with CORS middleware
+│   ├── routes.py              # /v1/completions, /v1/chat/completions, /metrics endpoints
+│   ├── schemas.py             # Pydantic request/response models (completion, chat, streaming)
+│   └── stream.py              # SSE streaming generator with per-chunk token + metrics events
+│
 ├── docs/
 │   ├── vllm.md                # Notes on vLLM concepts: prefill vs decode
 │   └── PagedAttention.md      # Notes on PagedAttention memory management
 │
-└── requirements.txt           # torch, transformers
+└── requirements.txt           # torch, transformers, fastapi, uvicorn, streamlit, pydantic, requests
 ```
+
+## Quickstart
+
+### 1. Install dependencies
+
+```bash
+git clone <repo-url>
+cd miniVllm
+pip install -r requirements.txt
+```
+
+### 2. Model access
+
+The default model is `meta-llama/Llama-3.2-3B`. You need a HuggingFace account with access granted:
+
+```bash
+huggingface-cli login
+```
+
+To skip this and use a lightweight model for quick testing, change the model name in `core/server.py`:
+
+```python
+model_runner = ModelRunner(model_name="gpt2")
+```
+
+### 3a. Run a direct concurrent inference test
+
+```bash
+python main.py
+```
+
+Spawns three client threads submitting prompts concurrently. The engine batches them automatically.
+
+### 3b. Run the REST API + Visualization Dashboard
+
+Open two terminals:
+
+**Terminal 1 — start the API server:**
+
+```bash
+uvicorn api.app:app --host 0.0.0.0 --port 8000
+```
+
+**Terminal 2 — start the Streamlit dashboard:**
+
+```bash
+streamlit run ui.py
+```
+
+Then open [http://localhost:8501](http://localhost:8501) in your browser.
+
+## Visualization Dashboard
+
+`ui.py` is a multi-user inference monitoring interface built with Streamlit.
+
+**Features:**
+- Up to 8 concurrent user panels in a 2-column grid layout
+- Add / remove user panels dynamically with the "+ Add User" button
+- Each panel has an independent prompt input, max tokens slider, and Generate button
+- Tokens stream in real-time with a cursor animation (`▌`) as the engine generates
+- Per-request metrics displayed after generation completes:
+
+| Metric | Description |
+|---|---|
+| Tokens/sec | Generation throughput for this request |
+| TTFT | Time to first token (ms) |
+| Prefix cache | Hit or miss — whether KV blocks were reused from a prior request |
+| KV blocks | Number of memory blocks allocated for this request |
+| Batch ID | Which engine batch this request was processed in |
+| Total latency | End-to-end wall time (ms) |
+
+- Global metrics bar (refreshes every 10 seconds): active requests, queue size, total requests served
+- The dashboard connects to the API server at `localhost:8000` — start the API first
 
 ## How It Works
 
@@ -184,9 +269,40 @@ The HuggingFace attention layer is replaced with a custom implementation that ex
 - Manages a global pool of `num_blocks` blocks (default 1024, size 16 tokens each)
 - `allocate_for_request(block_table, num_tokens)` — fills the last block first, allocates new blocks when needed
 - `free_request(block_table)` — returns all blocks from a finished request back to the free pool
+- `lookup_prefix(token_ids)` — checks the prefix cache for reusable KV blocks matching the request's prompt
+- `cache_completed_blocks(token_ids, block_table)` — stores fully filled blocks into the prefix cache after prefill
 - `stats()` — returns total / allocated / free block counts
 
-### 8. Custom LlamaModel
+### 8. Prefix Caching
+
+**`kv_cache/prefix_cache.py`** — `PrefixCache`:
+- An LRU `OrderedDict` keyed by the hash of a token prefix
+- `lookup(token_ids)` — returns the longest matching prefix and its cached blocks (if any)
+- `insert(token_ids, blocks)` — stores completed blocks; evicts least-recently-used entries when capacity is exceeded
+- Reference-counted blocks — shared prefix blocks are not freed until all referencing requests finish
+
+On each new request, `KVCacheManager.lookup_prefix()` walks the token sequence in block-sized chunks and returns any cached blocks that match. The prefill phase skips those tokens entirely, starting the KV computation from the first uncached position. This is especially effective when many requests share a long system prompt.
+
+### 9. REST API & Streaming
+
+**`api/app.py`** — FastAPI application with CORS middleware. Initializes a shared `Server` instance on startup.
+
+**`api/routes.py`** — Three endpoints:
+
+| Endpoint | Method | Description |
+|---|---|---|
+| `/v1/completions` | POST | Text completion (streaming or blocking) |
+| `/v1/chat/completions` | POST | Chat with message history (streaming or blocking) |
+| `/metrics` | GET | Global engine stats: active requests, queue size, total served |
+
+**`api/schemas.py`** — Pydantic models for request/response shapes, compatible with the OpenAI API format.
+
+**`api/stream.py`** — SSE streaming generator:
+- Polls the request handle token by token
+- Yields each token as a `data: {...}` SSE event
+- Emits a final `data: {"type": "metrics", ...}` event containing TTFT, tokens/sec, prefix cache status, KV blocks used, and total latency
+
+### 10. Custom LlamaModel
 
 **`models/llama_decoder.py`** — `LlamaDecoderLayer(nn.Module)`:
 - Single transformer layer with pluggable attention backend
@@ -203,73 +319,53 @@ The HuggingFace attention layer is replaced with a custom implementation that ex
 ## Architecture Overview
 
 ```
-Client Threads (main.py)
-        │ submit_request(prompt)
+Client Threads (main.py)             HTTP Clients / Dashboard (ui.py)
+        │ submit_request(prompt)              │ POST /v1/completions
+        ▼                                     ▼
+┌───────────────────┐             ┌───────────────────────┐
+│   Server          │             │   FastAPI (api/)       │
+│ (thread-safe)     │             │ routes + SSE streaming │
+└───────┬───────────┘             └──────────┬────────────┘
+        │                                    │
+        └──────────────┬─────────────────────┘
+                       │ enqueue Request
+                       ▼
+              ┌───────────────────┐
+              │   RequestQueue    │  Thread-safe deque
+              └───────┬───────────┘
+                      │ dequeue_many()
+                      ▼
+┌─────────────────────────────────────────────────────────┐
+│   Engine (daemon thread)                                │
+│                                                         │
+│  ┌─────────────┐   ┌──────────────┐  ┌───────────────┐ │
+│  │  Scheduler  │   │ KVCache      │  │ PrefixCache   │ │
+│  │ (batch=8)   │   │ Manager      │  │ (LRU blocks)  │ │
+│  └──────┬──────┘   └──────┬───────┘  └───────┬───────┘ │
+│         │                 │                   │         │
+│  ┌──────▼─────────────────▼───────────────────▼──────┐  │
+│  │   Engine.serve()                                   │  │
+│  │   lookup_prefix() → prefill_batch() / decode_batch│  │
+│  └──────────────────────┬─────────────────────────────┘  │
+│                         │                               │
+│  ┌──────────────────────▼────────────────────────────┐  │
+│  │   ModelRunner                                      │  │
+│  │   ┌─────────────────────────────────────────────┐ │  │
+│  │   │   LlamaModel                                │ │  │
+│  │   │   ├── embed_tokens                          │ │  │
+│  │   │   ├── LlamaDecoderLayer x N                 │ │  │
+│  │   │   │   ├── LayerNorm                         │ │  │
+│  │   │   │   ├── PagedAttention                    │ │  │
+│  │   │   │   │   └── RoPE                          │ │  │
+│  │   │   │   └── MLP                               │ │  │
+│  │   │   ├── final norm                            │ │  │
+│  │   │   └── lm_head                               │ │  │
+│  │   └─────────────────────────────────────────────┘ │  │
+│  └───────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────┘
+        │ request.completed.set() / SSE stream
         ▼
-┌───────────────────┐
-│   Server          │  Creates Request, blocks on request.completed
-└───────┬───────────┘
-        │ enqueue
-        ▼
-┌───────────────────┐
-│   RequestQueue    │  Thread-safe deque
-└───────┬───────────┘
-        │ dequeue_many()
-        ▼
-┌─────────────────────────────────────────┐
-│   Engine (daemon thread)                │
-│                                         │
-│  ┌─────────────┐   ┌──────────────────┐ │
-│  │  Scheduler  │   │  KVCacheManager  │ │
-│  │ (batch=8)   │   │  (block pool)    │ │
-│  └──────┬──────┘   └────────┬─────────┘ │
-│         │                   │           │
-│  ┌──────▼───────────────────▼────────┐  │
-│  │   Engine.serve()                  │  │
-│  │   prefill_batch() / decode_batch()│  │
-│  └──────────────┬────────────────────┘  │
-│                 │                        │
-│  ┌──────────────▼────────────────────┐  │
-│  │   ModelRunner                     │  │
-│  │   ┌─────────────────────────────┐ │  │
-│  │   │   LlamaModel                │ │  │
-│  │   │   ├── embed_tokens          │ │  │
-│  │   │   ├── LlamaDecoderLayer x N │ │  │
-│  │   │   │   ├── LayerNorm         │ │  │
-│  │   │   │   ├── PagedAttention    │ │  │
-│  │   │   │   │   └── RoPE          │ │  │
-│  │   │   │   └── MLP               │ │  │
-│  │   │   ├── final norm            │ │  │
-│  │   │   └── lm_head               │ │  │
-│  │   └─────────────────────────────┘ │  │
-│  └───────────────────────────────────┘  │
-└─────────────────────────────────────────┘
-        │ request.completed.set()
-        ▼
-┌───────────────────┐
-│   ResponseQueue   │  Finished requests
-└───────┬───────────┘
-        │ unblocks client thread
-        ▼
-Client prints (text, latency)
-```
-
-## Quickstart
-
-```bash
-pip install -r requirements.txt
-python main.py
-```
-
-> Requires access to `meta-llama/Llama-3.2-3B` on HuggingFace. Run `huggingface-cli login` first or set `HUGGING_FACE_HUB_TOKEN`.
-
-`main.py` starts a Server and submits three prompts concurrently from separate client threads.
-
-To use a lighter model for testing:
-
-```python
-# in server.py or model_runner.py
-model_runner = ModelRunner(model_name="gpt2")
+Client prints (text, latency) / Dashboard renders tokens + metrics
 ```
 
 ## Benchmarking
@@ -312,19 +408,20 @@ Batching wins by amortizing the high compute cost of prefill across multiple seq
 
 See [`docs/vllm.md`](./docs/vllm.md) for notes on the prefill vs decode distinction, and [`docs/PagedAttention.md`](./docs/PagedAttention.md) for how vLLM extends this with paged memory management.
 
-## What's Missing (vs Real vLLM)
-
-This is intentionally minimal. Real vLLM adds:
+## What's Implemented vs What's Missing
 
 | Feature | Status |
 |---|---|
-| PagedAttention (non-contiguous KV blocks) | Implemented (architecture + block manager; decode still uses dense tensor KV) |
+| Paged attention (non-contiguous KV blocks) | Implemented |
 | Custom attention with RoPE + GQA | Implemented |
 | Continuous batching | Implemented |
-| Async engine / API server | Partial (threaded Server) |
+| Prefix caching (LRU, block-level) | Implemented |
+| OpenAI-compatible API server | Implemented |
+| SSE token streaming with metrics | Implemented |
+| Multi-user visualization dashboard | Implemented |
 | GPU memory pre-allocation | Not implemented |
 | Beam search / parallel sampling | Not implemented |
 | Quantization (AWQ, GPTQ) | Not implemented |
 | Preemption / request eviction | Not implemented |
 
-The goal is to understand the **prefill/decode split**, **KV cache reuse**, **continuous batching**, and **paged memory management** — the core ideas everything else in vLLM is built on top of.
+The goal is to understand the **prefill/decode split**, **KV cache reuse**, **continuous batching**, **paged memory management**, and **prefix caching** — the core ideas everything else in vLLM is built on top of.
