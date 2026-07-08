@@ -9,11 +9,9 @@ st.set_page_config(page_title="miniVllm Dashboard", layout="wide")
 st.title("miniVllm Dashboard")
 
 # ---------------------------------------------------------------------------
-# Per-user stream buffers stored in session_state.
-# Background threads mutate the dict contents (not the key), which avoids
-# the ScriptRunContext error that happens when threads do st.session_state[k]=v
+# Constants
 # ---------------------------------------------------------------------------
-NUM_USERS = 4
+MAX_USERS = 8
 
 DEFAULT_PROMPTS = [
     "Explain how neural networks learn using backpropagation, step by step.",
@@ -21,16 +19,30 @@ DEFAULT_PROMPTS = [
     "What is the capital of France?",
     "Write a Python function that checks if a number is prime.",
 ]
-
 DEFAULT_MAX_TOKENS = [256, 512, 32, 128]
+GENERIC_PROMPT     = "Enter your prompt here."
+GENERIC_MAX_TOKENS = 256
 
-for i in range(NUM_USERS):
-    st.session_state.setdefault(f"response_{i}",   "")
-    st.session_state.setdefault(f"metrics_{i}",    None)
-    st.session_state.setdefault(f"error_{i}",      "")
-    st.session_state.setdefault(f"generating_{i}", False)
-    if f"buf_{i}" not in st.session_state:
-        st.session_state[f"buf_{i}"] = {
+
+def _default_prompt(slot_id: int) -> str:
+    return DEFAULT_PROMPTS[slot_id] if slot_id < len(DEFAULT_PROMPTS) else GENERIC_PROMPT
+
+
+def _default_max_tokens(slot_id: int) -> int:
+    return DEFAULT_MAX_TOKENS[slot_id] if slot_id < len(DEFAULT_MAX_TOKENS) else GENERIC_MAX_TOKENS
+
+
+# ---------------------------------------------------------------------------
+# Per-slot session state helpers
+# ---------------------------------------------------------------------------
+def _init_slot(slot_id: int):
+    """Idempotently initialise session state for a slot."""
+    st.session_state.setdefault(f"response_{slot_id}",   "")
+    st.session_state.setdefault(f"metrics_{slot_id}",    None)
+    st.session_state.setdefault(f"error_{slot_id}",      "")
+    st.session_state.setdefault(f"generating_{slot_id}", False)
+    if f"buf_{slot_id}" not in st.session_state:
+        st.session_state[f"buf_{slot_id}"] = {
             "tokens": [],
             "metrics": None,
             "done": True,
@@ -39,6 +51,18 @@ for i in range(NUM_USERS):
         }
 
 
+# Ordered list of active slot IDs and a monotonic counter for new ones
+if "active_slots" not in st.session_state:
+    st.session_state.active_slots = list(range(4))   # [0, 1, 2, 3]
+    st.session_state.next_slot_id = 4
+
+for _sid in st.session_state.active_slots:
+    _init_slot(_sid)
+
+
+# ---------------------------------------------------------------------------
+# Streaming helper
+# ---------------------------------------------------------------------------
 def start_stream(buf, prompt, max_tokens):
     """Reset buffer and launch background thread that streams from the API."""
     with buf["lock"]:
@@ -100,8 +124,8 @@ def render_global_metrics():
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Active Requests", gm["active_requests"] if gm else "—")
-    c2.metric("Queue Size",       gm["queue_size"]       if gm else "—")
-    c3.metric("Total Requests",   gm["total_requests"]   if gm else "—")
+    c2.metric("Queue Size",      gm["queue_size"]       if gm else "—")
+    c3.metric("Total Requests",  gm["total_requests"]   if gm else "—")
     with c4:
         if st.button("Refresh Metrics", use_container_width=True):
             st.rerun(scope="fragment")
@@ -114,35 +138,44 @@ st.divider()
 
 
 # ---------------------------------------------------------------------------
-# Per-user inference metrics display
+# Per-user inference metrics — 3 columns × 2 rows so values don't get clipped
 # ---------------------------------------------------------------------------
 def render_inference_metrics(m):
-    m1, m2, m3, m4, m5, m6 = st.columns(6)
-    m1.metric("Token/sec",    m["tokens_per_sec"])
-    m2.metric("TTFT",         f"{m['ttft_ms']} ms")
-    m3.metric("Prefix Cache", m["prefix_cache"])
-    m4.metric("KV Blocks",    m["kv_blocks"])
-    m5.metric("Batch ID",     m["batch_id"])
-    m6.metric("Latency",      f"{m['latency_ms']} ms")
+    r1c1, r1c2, r1c3 = st.columns(3)
+    r1c1.metric("Token/sec",    m["tokens_per_sec"])
+    r1c2.metric("TTFT",         f"{m['ttft_ms']} ms")
+    r1c3.metric("Prefix Cache", m["prefix_cache"])
+
+    r2c1, r2c2, r2c3 = st.columns(3)
+    r2c1.metric("KV Blocks",    m["kv_blocks"])
+    r2c2.metric("Batch ID",     m["batch_id"])
+    r2c3.metric("Latency",      f"{m['latency_ms']} ms")
+
     if m["prefix_cache"] == "HIT":
         st.success("Prefix cache hit — tokens reused from a previous request")
 
 
 # ---------------------------------------------------------------------------
-# User panel — each is an independent fragment that polls its own buffer.
+# User panel — independent fragment that polls its own buffer.
 # run_every=0.5 drives the streaming display without blocking other panels.
 # ---------------------------------------------------------------------------
 @st.fragment(run_every=0.5)
-def render_user(i):
-    buf          = st.session_state[f"buf_{i}"]
-    is_generating = st.session_state[f"generating_{i}"]
+def render_user(slot_id: int):
+    buf           = st.session_state[f"buf_{slot_id}"]
+    is_generating = st.session_state[f"generating_{slot_id}"]
 
-    st.markdown(f"### User {i + 1}")
+    # Header: label + Remove button
+    hdr_left, hdr_right = st.columns([4, 1])
+    user_num = st.session_state.active_slots.index(slot_id) + 1
+    hdr_left.markdown(f"### User {user_num}")
+    if hdr_right.button("Remove", key=f"remove_{slot_id}", use_container_width=True):
+        st.session_state.active_slots.remove(slot_id)
+        st.rerun()   # full-page rerun to rebuild grid
 
     prompt = st.text_area(
         "Prompt",
-        value=DEFAULT_PROMPTS[i],
-        key=f"prompt_{i}",
+        value=_default_prompt(slot_id),
+        key=f"prompt_{slot_id}",
         height=90,
         label_visibility="collapsed",
     )
@@ -150,23 +183,28 @@ def render_user(i):
     with col_btn:
         clicked = st.button(
             "Generating..." if is_generating else "Generate",
-            key=f"submit_{i}",
+            key=f"submit_{slot_id}",
             use_container_width=True,
             disabled=is_generating or not (prompt or "").strip(),
             type="primary",
         )
     with col_slider:
-        max_tokens = st.slider("Max tokens", 32, 512, DEFAULT_MAX_TOKENS[i], key=f"max_tokens_{i}")
+        max_tokens = st.slider(
+            "Max tokens", 32, 512,
+            _default_max_tokens(slot_id),
+            key=f"max_tokens_{slot_id}",
+        )
 
-    # Response area — always rendered here, below the controls
-    response_placeholder = st.empty()
+    # Fixed-height scrollable response area keeps boxes aligned across columns
+    with st.container(height=250):
+        response_placeholder = st.empty()
 
     # --- Button clicked: reset state, launch thread, rerun to show disabled button ---
     if clicked:
-        st.session_state[f"generating_{i}"] = True
-        st.session_state[f"response_{i}"]   = ""
-        st.session_state[f"metrics_{i}"]    = None
-        st.session_state[f"error_{i}"]      = ""
+        st.session_state[f"generating_{slot_id}"] = True
+        st.session_state[f"response_{slot_id}"]   = ""
+        st.session_state[f"metrics_{slot_id}"]    = None
+        st.session_state[f"error_{slot_id}"]      = ""
         start_stream(buf, prompt.strip(), max_tokens)
         st.rerun(scope="fragment")
 
@@ -179,33 +217,47 @@ def render_user(i):
             error     = buf["error"]
 
         if error:
-            st.session_state[f"error_{i}"]      = error
-            st.session_state[f"generating_{i}"] = False
+            st.session_state[f"error_{slot_id}"]      = error
+            st.session_state[f"generating_{slot_id}"] = False
         elif is_done:
             response_placeholder.markdown(full_text)
-            st.session_state[f"response_{i}"]   = full_text
-            st.session_state[f"metrics_{i}"]    = metrics
-            st.session_state[f"generating_{i}"] = False
+            st.session_state[f"response_{slot_id}"]   = full_text
+            st.session_state[f"metrics_{slot_id}"]    = metrics
+            st.session_state[f"generating_{slot_id}"] = False
         else:
             response_placeholder.markdown(full_text + " ▌")
-    elif st.session_state[f"response_{i}"]:
-        response_placeholder.markdown(st.session_state[f"response_{i}"])
+    elif st.session_state[f"response_{slot_id}"]:
+        response_placeholder.markdown(st.session_state[f"response_{slot_id}"])
 
-    if st.session_state[f"error_{i}"]:
-        st.error(st.session_state[f"error_{i}"])
+    if st.session_state[f"error_{slot_id}"]:
+        st.error(st.session_state[f"error_{slot_id}"])
 
-    m = st.session_state[f"metrics_{i}"]
+    m = st.session_state[f"metrics_{slot_id}"]
     if m:
         render_inference_metrics(m)
 
 
 # ---------------------------------------------------------------------------
-# 2×2 grid
+# Add User button + dynamic 2-column grid
 # ---------------------------------------------------------------------------
-row1 = st.columns(2, gap="large")
-row2 = st.columns(2, gap="large")
+slots   = st.session_state.active_slots
+can_add = len(slots) < MAX_USERS
 
-for i, col in enumerate([row1[0], row1[1], row2[0], row2[1]]):
-    with col:
-        with st.container(border=True):
-            render_user(i)
+if st.button(
+    "+ Add User",
+    disabled=not can_add,
+    help=f"Maximum {MAX_USERS} users" if not can_add else "",
+):
+    new_id = st.session_state.next_slot_id
+    st.session_state.next_slot_id += 1
+    _init_slot(new_id)
+    st.session_state.active_slots.append(new_id)
+    st.rerun()
+
+for row_start in range(0, len(slots), 2):
+    row_slots = slots[row_start : row_start + 2]
+    cols = st.columns(len(row_slots), gap="large")
+    for col, sid in zip(cols, row_slots):
+        with col:
+            with st.container(border=True):
+                render_user(sid)

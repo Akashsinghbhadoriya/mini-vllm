@@ -1,9 +1,8 @@
 from request.request import RequestStatus
+from request.handle import STREAM_DONE
 import torch
 import threading
 import time
-
-STREAM_DONE = object()
 
 class Engine:
 
@@ -146,6 +145,10 @@ class Engine:
                     if request.streaming:
                         token = self.model_runner.decode_single_token(request.last_token_id)
                         request.token_queue.put(token)
+
+                for request in batch:
+                    if request.status == RequestStatus.FINISHED:
+                        continue
                     current_len = request.block_table.used_tokens() - request.kv_seq_len
                     self.kv_manager.allocate_for_request(
                         request.block_table,

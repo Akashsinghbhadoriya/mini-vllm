@@ -56,7 +56,8 @@ class Server:
     def submit(self, prompt, max_new_tokens, streaming=False):
 
         with self.counter_lock:
-            request_id = ++self.request_counter
+            self.request_counter += 1
+            request_id = self.request_counter
             request = Request(request_id, 
                               prompt, 
                               max_new_tokens,
